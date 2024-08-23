@@ -29,6 +29,7 @@ import (
 	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
 	celSchema "github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/k8scel/schema"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/k8scel/transform"
+	"github.com/open-policy-agent/frameworks/constraint/pkg/core/templates"
 	constraintstatusv1beta1 "github.com/open-policy-agent/gatekeeper/v3/apis/status/v1beta1"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/constraintstatus"
@@ -38,6 +39,7 @@ import (
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/readiness"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
 	"github.com/open-policy-agent/gatekeeper/v3/pkg/watch"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -48,6 +50,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	rest "k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -64,11 +67,18 @@ var (
 	log                 = logf.Log.V(logging.DebugLevel).WithName("controller").WithValues(logging.Process, "constraint_controller")
 	discoveryErr        *apiutil.ErrResourceDiscoveryFailed
 	DefaultGenerateVAPB = flag.Bool("default-create-vap-binding-for-constraints", false, "Create VAPBinding resource for constraint of the template containing VAP-style CEL source. Allowed values are false: do not create Validating Admission Policy Binding, true: create Validating Admission Policy Binding.")
+	DefaultGenerateVAP  = flag.Bool("default-create-vap-for-templates", false, "Create VAP resource for template containing VAP-style CEL source. Allowed values are false: do not create Validating Admission Policy unless generateVAP: true is set on constraint template explicitly, true: create Validating Admission Policy unless generateVAP: false is set on constraint template explicitly.")
 )
 
+var (
+	ErrValidatingAdmissionPolicyAPIDisabled = errors.New("ValidatingAdmissionPolicy API is not enabled")
+	ErrVAPConditionsNotSatisfied            = errors.New("Conditions are not satisfied to generate ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding")
+)
 var vapMux sync.RWMutex
 
 var VapAPIEnabled *bool
+
+var GroupVersion *schema.GroupVersion
 
 type Adder struct {
 	CFClient         *constraintclient.Client
@@ -173,21 +183,15 @@ func add(mgr manager.Manager, r reconcile.Reconciler, events <-chan event.Generi
 
 	// Watch for changes to the provided constraint
 	err = c.Watch(
-		&source.Channel{
-			Source:         events,
-			DestBufferSize: 1024,
-		},
-		handler.EnqueueRequestsFromMapFunc(util.EventPackerMapFunc()),
-	)
+		source.Channel(
+			events,
+			handler.EnqueueRequestsFromMapFunc(util.EventPackerMapFunc())))
 	if err != nil {
 		return err
 	}
 
-	// Watch for changes to ConstraintStatus
 	err = c.Watch(
-		source.Kind(mgr.GetCache(), &constraintstatusv1beta1.ConstraintPodStatus{}),
-		handler.EnqueueRequestsFromMapFunc(constraintstatus.PodStatusToConstraintMapper(true, util.EventPackerMapFunc())),
-	)
+		source.Kind(mgr.GetCache(), &constraintstatusv1beta1.ConstraintPodStatus{}, handler.TypedEnqueueRequestsFromMapFunc(constraintstatus.PodStatusToConstraintMapper(true, util.EventPackerMapFunc()))))
 	if err != nil {
 		return err
 	}
@@ -306,30 +310,72 @@ func (r *ReconcileConstraint) Reconcile(ctx context.Context, request reconcile.R
 				if err2 := r.writer.Update(ctx, status); err2 != nil {
 					log.Error(err2, "could not report error for validation of enforcement action")
 				}
+				return reconcile.Result{}, err
 			}
 			generateVAPB, VAPEnforcementActions, err := shouldGenerateVAPB(*DefaultGenerateVAPB, enforcementAction, instance)
 			if err != nil {
+				log.Error(err, "could not determine if VAPBinding should be generated")
 				status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: err.Error()})
-				log.Error(err, "could not get enforcement actions for VAP")
 				if err2 := r.writer.Update(ctx, status); err2 != nil {
-					log.Error(err2, "could not report error for getting enforcement actions for VAP")
+					log.Error(err2, "could not report error when determining if VAPBinding should be generated")
 				}
 				return reconcile.Result{}, err
 			}
+			isAPIEnabled := false
+			var groupVersion *schema.GroupVersion
 			if generateVAPB {
-				if !IsVapAPIEnabled() {
-					r.log.V(1).Info("Warning: VAP API is not enabled, cannot create VAPBinding")
+				isAPIEnabled, groupVersion = IsVapAPIEnabled()
+			}
+			if generateVAPB {
+				if !isAPIEnabled {
+					log.Error(ErrValidatingAdmissionPolicyAPIDisabled, "Cannot generate ValidatingAdmissionPolicyBinding", "constraint", instance.GetName())
+					status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: fmt.Sprintf("%s, cannot generate ValidatingAdmissionPolicyBinding", ErrValidatingAdmissionPolicyAPIDisabled.Error())})
+					if err2 := r.writer.Update(ctx, status); err2 != nil {
+						log.Error(err2, "could not update constraint status error when ValidatingAdmissionPolicy API is not enabled")
+					}
 					generateVAPB = false
-				}
-				if !HasVAPCel(ct) {
-					r.log.V(1).Info("Warning: ConstraintTemplate does not contain VAP-style CEL source, cannot create VAPBinding")
-					generateVAPB = false
+				} else {
+					unversionedCT := &templates.ConstraintTemplate{}
+					if err := r.scheme.Convert(ct, unversionedCT, nil); err != nil {
+						status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: err.Error()})
+						if err2 := r.writer.Update(ctx, status); err2 != nil {
+							log.Error(err2, "could not update constraint status error when converting ConstraintTemplate to unversioned")
+						}
+						return reconcile.Result{}, err
+					}
+					hasVAP, err := ShouldGenerateVAP(unversionedCT)
+					switch {
+					case errors.Is(err, celSchema.ErrCodeNotDefined):
+						generateVAPB = false
+					case err != nil:
+						log.Error(err, "could not determine if ConstraintTemplate is configured to generate ValidatingAdmissionPolicy", "constraint", instance.GetName(), "constraint_template", ct.GetName())
+						status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: err.Error()})
+						if err2 := r.writer.Update(ctx, status); err2 != nil {
+							log.Error(err2, "could not update constraint status error when determining if ConstraintTemplate is configured to generate ValidatingAdmissionPolicy")
+						}
+						generateVAPB = false
+					case !hasVAP:
+						log.Error(ErrVAPConditionsNotSatisfied, "Cannot generate ValidatingAdmissionPolicyBinding", "constraint", instance.GetName(), "constraint_template", ct.GetName())
+						status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: fmt.Sprintf("%s, cannot generate ValidatingAdmissionPolicyBinding", ErrVAPConditionsNotSatisfied.Error())})
+						if err2 := r.writer.Update(ctx, status); err2 != nil {
+							log.Error(err2, "could not update constraint status error when conditions are not satisfied to generate ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding")
+						}
+						generateVAPB = false
+					default:
+					}
 				}
 			}
 			r.log.Info("constraint controller", "generateVAPB", generateVAPB)
 			// generate vapbinding resources
-			if generateVAPB {
-				currentVapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+			if generateVAPB && groupVersion != nil {
+				currentVapBinding, err := vapBindingForVersion(*groupVersion)
+				if err != nil {
+					status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: err.Error()})
+					if err2 := r.writer.Update(ctx, status); err2 != nil {
+						log.Error(err2, "could not get vapbinding version")
+					}
+					return reconcile.Result{}, err
+				}
 				vapBindingName := fmt.Sprintf("gatekeeper-%s", instance.GetName())
 				log.Info("check if vapbinding exists", "vapBindingName", vapBindingName)
 				if err := r.reader.Get(ctx, types.NamespacedName{Name: vapBindingName}, currentVapBinding); err != nil {
@@ -338,20 +384,22 @@ func (r *ReconcileConstraint) Reconcile(ctx context.Context, request reconcile.R
 					}
 					currentVapBinding = nil
 				}
-				newVapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
 				transformedVapBinding, err := transform.ConstraintToBinding(instance, VAPEnforcementActions)
 				if err != nil {
 					status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: err.Error()})
 					if err2 := r.writer.Update(ctx, status); err2 != nil {
-						log.Error(err2, "could not report transform vapbinding error status")
+						log.Error(err2, "could not report transform vapbinding error", "vapBindingName", vapBindingName)
 					}
 					return reconcile.Result{}, err
 				}
-				if currentVapBinding == nil {
-					newVapBinding = transformedVapBinding.DeepCopy()
-				} else {
-					newVapBinding = currentVapBinding.DeepCopy()
-					newVapBinding.Spec = transformedVapBinding.Spec
+
+				newVapBinding, err := getRunTimeVAPBinding(groupVersion, transformedVapBinding, currentVapBinding)
+				if err != nil {
+					status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: err.Error()})
+					if err2 := r.writer.Update(ctx, status); err2 != nil {
+						log.Error(err2, "could not get VAPBinding object with runtime group version", "vapBindingName", vapBindingName)
+					}
+					return reconcile.Result{}, err
 				}
 
 				if err := controllerutil.SetControllerReference(instance, newVapBinding, r.scheme); err != nil {
@@ -380,8 +428,15 @@ func (r *ReconcileConstraint) Reconcile(ctx context.Context, request reconcile.R
 			}
 			// do not generate vapbinding resources
 			// remove if exists
-			if !generateVAPB {
-				currentVapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+			if !generateVAPB && groupVersion != nil {
+				currentVapBinding, err := vapBindingForVersion(*groupVersion)
+				if err != nil {
+					status.Status.Errors = append(status.Status.Errors, constraintstatusv1beta1.Error{Message: err.Error()})
+					if err2 := r.writer.Update(ctx, status); err2 != nil {
+						log.Error(err2, "could not get vapbinding version")
+					}
+					return reconcile.Result{}, err
+				}
 				vapBindingName := fmt.Sprintf("gatekeeper-%s", instance.GetName())
 				log.Info("check if vapbinding exists", "vapBindingName", vapBindingName)
 				if err := r.reader.Get(ctx, types.NamespacedName{Name: vapBindingName}, currentVapBinding); err != nil {
@@ -507,16 +562,15 @@ func (r *ReconcileConstraint) getOrCreatePodStatus(ctx context.Context, constrai
 	return statusObj, nil
 }
 
-func HasVAPCel(ct *v1beta1.ConstraintTemplate) bool {
-	if len(ct.Spec.Targets[0].Code) == 0 {
-		return false
+func ShouldGenerateVAP(ct *templates.ConstraintTemplate) (bool, error) {
+	source, err := celSchema.GetSourceFromTemplate(ct)
+	if err != nil {
+		return false, err
 	}
-	for _, code := range ct.Spec.Targets[0].Code {
-		if code.Engine == celSchema.Name {
-			return true
-		}
+	if source.GenerateVAP == nil {
+		return *DefaultGenerateVAP, nil
 	}
-	return false
+	return *source.GenerateVAP, nil
 }
 
 func logAddition(l logr.Logger, constraint *unstructured.Unstructured, enforcementAction util.EnforcementAction) {
@@ -609,35 +663,137 @@ func (c *ConstraintsCache) reportTotalConstraints(ctx context.Context, reporter 
 	}
 }
 
-func IsVapAPIEnabled() bool {
+func IsVapAPIEnabled() (bool, *schema.GroupVersion) {
+	vapMux.RLock()
+	if VapAPIEnabled != nil {
+		apiEnabled, gvk := *VapAPIEnabled, GroupVersion
+		vapMux.RUnlock()
+		return apiEnabled, gvk
+	}
+
+	vapMux.RUnlock()
 	vapMux.Lock()
 	defer vapMux.Unlock()
 
 	if VapAPIEnabled != nil {
-		return *VapAPIEnabled
+		return *VapAPIEnabled, GroupVersion
 	}
-	groupVersion := schema.GroupVersion{Group: "admissionregistration.k8s.io", Version: "v1beta1"}
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		log.Info("IsVapAPIEnabled InClusterConfig", "error", err)
 		VapAPIEnabled = new(bool)
 		*VapAPIEnabled = false
-		return false
+		return false, nil
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Info("IsVapAPIEnabled NewForConfig", "error", err)
 		*VapAPIEnabled = false
-		return false
+		return false, nil
 	}
-	if _, err := clientset.Discovery().ServerResourcesForGroupVersion(groupVersion.String()); err != nil {
-		log.Info("IsVapAPIEnabled ServerResourcesForGroupVersion", "error", err)
-		VapAPIEnabled = new(bool)
-		*VapAPIEnabled = false
-		return false
+
+	groupVersion := admissionregistrationv1.SchemeGroupVersion
+	resList, err := clientset.Discovery().ServerResourcesForGroupVersion(groupVersion.String())
+	if err == nil {
+		for i := 0; i < len(resList.APIResources); i++ {
+			if resList.APIResources[i].Name == "validatingadmissionpolicies" {
+				VapAPIEnabled = new(bool)
+				*VapAPIEnabled = true
+				GroupVersion = &groupVersion
+				return true, GroupVersion
+			}
+		}
 	}
-	log.Info("IsVapAPIEnabled true")
+
+	groupVersion = admissionregistrationv1beta1.SchemeGroupVersion
+	resList, err = clientset.Discovery().ServerResourcesForGroupVersion(groupVersion.String())
+	if err == nil {
+		for i := 0; i < len(resList.APIResources); i++ {
+			if resList.APIResources[i].Name == "validatingadmissionpolicies" {
+				VapAPIEnabled = new(bool)
+				*VapAPIEnabled = true
+				GroupVersion = &groupVersion
+				return true, GroupVersion
+			}
+		}
+	}
+
+	log.Error(err, "error checking VAP API availability", "IsVapAPIEnabled", "false")
 	VapAPIEnabled = new(bool)
-	*VapAPIEnabled = true
-	return true
+	*VapAPIEnabled = false
+	return false, nil
+}
+
+func vapBindingForVersion(gvk schema.GroupVersion) (client.Object, error) {
+	switch gvk.Version {
+	case "v1":
+		return &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}, nil
+	case "v1beta1":
+		return &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}, nil
+	default:
+		return nil, errors.New("unrecognized version")
+	}
+}
+
+func getRunTimeVAPBinding(gvk *schema.GroupVersion, transformedVapBinding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding, currentVapBinding client.Object) (client.Object, error) {
+	if currentVapBinding == nil {
+		if gvk.Version == "v1" {
+			return v1beta1ToV1(transformedVapBinding)
+		}
+		return transformedVapBinding.DeepCopy(), nil
+	}
+	if gvk.Version == "v1" {
+		v1CurrentVAPBinding, ok := currentVapBinding.(*admissionregistrationv1.ValidatingAdmissionPolicyBinding)
+		if !ok {
+			return nil, errors.New("Unable to convert to v1 VAP")
+		}
+		v1CurrentVAPBinding = v1CurrentVAPBinding.DeepCopy()
+		tempVAPBinding, err := v1beta1ToV1(transformedVapBinding)
+		if err != nil {
+			return nil, err
+		}
+		v1CurrentVAPBinding.Spec = tempVAPBinding.Spec
+		return v1CurrentVAPBinding, nil
+	}
+	v1beta1VAPBinding, ok := currentVapBinding.(*admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding)
+	if !ok {
+		return nil, errors.New("Unable to convert to v1beta1 VAP")
+	}
+	v1beta1VAPBinding.Spec = transformedVapBinding.Spec
+	return v1beta1VAPBinding.DeepCopy(), nil
+}
+
+func v1beta1ToV1(v1beta1Obj *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding) (*admissionregistrationv1.ValidatingAdmissionPolicyBinding, error) {
+	// TODO(jgabani): Use r.scheme.Convert to convert from v1beta1 to v1 once the conversion bug is fixed - https://github.com/kubernetes/kubernetes/issues/126582
+	obj := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+	obj.SetName(v1beta1Obj.GetName())
+	obj.Spec.PolicyName = v1beta1Obj.Spec.PolicyName
+	obj.Spec.ParamRef = &admissionregistrationv1.ParamRef{
+		Name:                    v1beta1Obj.Spec.ParamRef.Name,
+		ParameterNotFoundAction: ptr.To[admissionregistrationv1.ParameterNotFoundActionType](admissionregistrationv1.AllowAction),
+	}
+	actions := []admissionregistrationv1.ValidationAction{}
+
+	for _, action := range v1beta1Obj.Spec.ValidationActions {
+		switch action {
+		case admissionregistrationv1beta1.Deny:
+			actions = append(actions, admissionregistrationv1.Deny)
+		case admissionregistrationv1beta1.Warn:
+			actions = append(actions, admissionregistrationv1.Warn)
+		default:
+			return nil, fmt.Errorf("%w: unrecognized enforcement action %s, must be `warn` or `deny`", transform.ErrBadEnforcementAction, action)
+		}
+	}
+
+	obj.Spec.ValidationActions = actions
+	if v1beta1Obj.Spec.MatchResources != nil {
+		if v1beta1Obj.Spec.MatchResources.ObjectSelector != nil {
+			obj.Spec.MatchResources.ObjectSelector = v1beta1Obj.Spec.MatchResources.ObjectSelector
+		}
+		if v1beta1Obj.Spec.MatchResources.NamespaceSelector != nil {
+			obj.Spec.MatchResources.NamespaceSelector = v1beta1Obj.Spec.MatchResources.NamespaceSelector
+		}
+	}
+
+	return obj, nil
 }
